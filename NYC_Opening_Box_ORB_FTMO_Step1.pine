@@ -1,0 +1,397 @@
+//@version=6
+strategy("NYC Opening Box ORB — FTMO Step 1 Compliant", overlay=true, initial_capital=200000, default_qty_type=strategy.fixed, default_qty_value=1, commission_type=strategy.commission.cash_per_contract, commission_value=4.60, slippage=2, process_orders_on_close=true, max_lines_count=200, max_labels_count=500, max_boxes_count=200)
+
+// ═══════════════════════════════════════════════════════════════════
+// NYC OPENING BOX ORB — FTMO STEP 1 OPTIMIZED (200K ACCOUNT)
+// ═══════════════════════════════════════════════════════════════════
+// 
+// FTMO RULES (Step 1):
+//  • Daily Loss Limit: $20,000 (10% of $200K)
+//  • Overall Drawdown Limit: $20,000 (10% of $200K)
+//  • No Overnight Holds: Mandatory close at session end
+//  • Max Risk Per Trade: $1,000 - $2,000 (0.5% - 1% account)
+//  • Commissions: $4.60 per contract round-trip (NQ)
+//  • Slippage: 2 ticks expected
+//
+// NOTE: Adjust dollarPerPoint for your instrument:
+//   NQ = $20/pt, MNQ = $2/pt, ES = $50/pt, MES = $5/pt
+// ═══════════════════════════════════════════════════════════════════
+
+
+// ───────────────────────── INPUTS ─────────────────────────
+openingSession   = input.session("0930-1010", "Opening Box Window (NY)", tooltip="09:30–10:10 ET on 5-min chart")
+tradingSession   = input.session("0930-1600", "NY Trading Session")
+sessTimezone     = input.string("America/New_York", "Timezone")
+
+// RISK MANAGEMENT (FTMO COMPLIANT)
+maxDailyLoss     = input.float(20000.0, "Daily Loss Limit ($, FTMO=$20K)", minval=1000)
+maxAccountDD     = input.float(20000.0, "Account Drawdown Limit ($, FTMO=$20K)", minval=1000)
+maxRiskPerTrade  = input.float(1000.0, "Max Risk Per Trade ($)", minval=100, maxval=5000, step=100, tooltip="Typically 0.5%-1% of account for FTMO")
+
+// ENTRY SETTINGS
+rrMultiple       = input.float(1.5, "Risk:Reward Ratio", minval=0.5, maxval=3.0, step=0.1, tooltip="TP = Entry + (SL distance × this multiple)")
+oneSignalPerDay  = input.bool(true, "Only one trade total per day (long OR short, not both)")
+extendBoxBars    = input.int(60, "Extend box forward (bars)", minval=5)
+extendTradeBars  = input.int(40, "Extend entry/SL/TP lines forward (bars)", minval=5)
+
+// POSITION SIZING (FTMO RULE: FIXED RISK)
+dollarPerPoint   = input.float(20, "$ value per point per contract (NQ=$20/pt, MNQ=$2/pt, ES=$50/pt, MES=$5/pt)", minval=0.01)
+
+// OPTIONAL FEATURES
+enablePartialExit = input.bool(false, "Enable partial exit at 50% TP", tooltip="Close 50% at halfway point")
+enableTradeStats  = input.bool(true, "Display trade statistics on chart")
+
+// COLORS
+boxBorderColor = color.new(color.orange, 40)
+boxBgColor     = color.new(color.orange, 92)
+midLineColor   = color.new(color.yellow, 40)
+slLineColor    = color.new(color.red, 35)
+tpLineColor    = color.new(#26a69a, 35)
+slTagColor     = color.new(color.red, 15)
+tpTagColor     = color.new(#26a69a, 15)
+flatColor      = color.new(color.gray, 15)
+warningColor   = color.new(color.maroon, 20)
+
+
+// ───────────────────────── SESSION / BOX STATE ─────────────────────────
+inOpeningWindow = not na(time(timeframe.period, openingSession, sessTimezone))
+inTradingWindow = not na(time(timeframe.period, tradingSession, sessTimezone))
+barClosed = barstate.isconfirmed
+newDay = ta.change(dayofmonth(time, sessTimezone)) != 0
+
+var float boxHigh        = na
+var float boxLow         = na
+var float boxMid         = na
+var bool  boxLocked      = false
+var bool  tradeTakenToday = false
+
+// Retest-entry tracking (independent for long/short)
+var bool shortBreakoutSeen = false
+var bool shortReenteredBox = false
+var bool longBreakoutSeen  = false
+var bool longReenteredBox  = false
+
+// FTMO Risk tracking
+var float dailyPnL        = 0.0
+var float peakAccountValue = 200000.0
+var float maxDrawdown      = 0.0
+
+
+if newDay
+    boxHigh           := na
+    boxLow            := na
+    boxMid            := na
+    boxLocked         := false
+    tradeTakenToday   := false
+    shortBreakoutSeen := false
+    shortReenteredBox := false
+    longBreakoutSeen  := false
+    longReenteredBox  := false
+    dailyPnL          := 0.0
+    peakAccountValue  := strategy.equity
+
+if inOpeningWindow and not boxLocked
+    boxHigh := na(boxHigh) ? high : math.max(boxHigh, high)
+    boxLow  := na(boxLow)  ? low  : math.min(boxLow, low)
+
+justFinishedBox = inOpeningWindow[1] and not inOpeningWindow and not boxLocked
+if justFinishedBox
+    boxLocked := true
+    boxMid    := (boxHigh + boxLow) / 2
+    box.new(bar_index, boxHigh, bar_index + extendBoxBars, boxLow, border_color=boxBorderColor, bgcolor=boxBgColor, border_width=2)
+    line.new(bar_index, boxMid, bar_index + extendBoxBars, boxMid, color=midLineColor, width=1, style=line.style_dashed)
+
+haveBox = boxLocked and not na(boxHigh) and not na(boxLow)
+
+
+// ───────────────────────── TRADE STATE ─────────────────────────
+var bool   inTrade       = false
+var string activeSide    = na
+var float  activeEntry   = na
+var float  activeSL      = na
+var float  activeTP      = na
+var int    entryBarIndex = na
+var float  activeQty     = 0.0
+var float  activeRisk    = 0.0
+var bool   partialClosed = false
+
+// Trade statistics
+var int    totalTrades   = 0
+var int    winTrades     = 0
+var int    lossTrades    = 0
+var float  totalPnL      = 0.0
+
+canSignal = haveBox and inTradingWindow and not inTrade and (not oneSignalPerDay or not tradeTakenToday)
+
+longSetup  = false
+shortSetup = false
+
+
+// ───────────────────────── RETEST ENTRY LOGIC ─────────────────────────
+if canSignal and barClosed
+    if not shortBreakoutSeen and not longBreakoutSeen
+        if close < boxLow
+            shortBreakoutSeen := true
+        else if close > boxHigh
+            longBreakoutSeen := true
+
+    else if shortBreakoutSeen
+        if close > boxLow
+            shortReenteredBox := true
+
+        retestTouch = high >= boxLow
+        rejectionCandle = retestTouch and (close < open) and (close <= boxLow)
+        shakeoutContinuation = shortReenteredBox and (close < boxLow)
+
+        if rejectionCandle or shakeoutContinuation
+            shortSetup := true
+            shortBreakoutSeen := false
+            shortReenteredBox := false
+
+    else if longBreakoutSeen
+        if close < boxHigh
+            longReenteredBox := true
+
+        retestTouch = low <= boxHigh
+        rejectionCandle = retestTouch and (close > open) and (close >= boxHigh)
+        shakeoutContinuation = longReenteredBox and (close > boxHigh)
+
+        if rejectionCandle or shakeoutContinuation
+            longSetup := true
+            longBreakoutSeen := false
+            longReenteredBox := false
+
+
+bool longFire  = false
+bool shortFire = false
+bool slFire    = false
+bool tpFire    = false
+bool flatFire  = false
+
+
+// ───────────────────────── ENTER TRADE (WITH FTMO RISK CHECKS) ─────────────────────────
+if longSetup
+    riskPts = close - boxMid
+    if riskPts > 0
+        // Calculate risk in dollars
+        riskDollars = riskPts * dollarPerPoint * 1
+        
+        // FTMO CHECK: Don't exceed max risk per trade
+        if riskDollars > maxRiskPerTrade
+            qty = math.max(1, math.floor(maxRiskPerTrade / (riskPts * dollarPerPoint)))
+        else
+            qty = 1
+        
+        // FTMO CHECK: Don't exceed daily loss limit
+        if dailyPnL + (riskPts * dollarPerPoint * qty) > maxDailyLoss
+            qty = 0
+        
+        if qty > 0
+            inTrade        := true
+            activeSide     := "long"
+            activeEntry    := close
+            activeSL       := boxMid
+            activeTP       := close + riskPts * rrMultiple
+            entryBarIndex  := bar_index
+            activeQty      := qty
+            activeRisk     := riskPts * dollarPerPoint * qty
+            partialClosed  := false
+            tradeTakenToday := true
+            longFire       := true
+            totalTrades    += 1
+
+            strategy.entry("Long", strategy.long, qty=qty)
+
+            line.new(bar_index, activeEntry, bar_index + extendTradeBars, activeEntry, color=color.new(color.lime, 20), width=2, style=line.style_solid)
+            line.new(bar_index, activeSL, bar_index + extendTradeBars, activeSL, color=slLineColor, width=2, style=line.style_dotted)
+            line.new(bar_index, activeTP, bar_index + extendTradeBars, activeTP, color=tpLineColor, width=2, style=line.style_dotted)
+
+            label.new(bar_index + extendTradeBars, activeEntry, "E " + str.tostring(activeEntry, format.mintick), xloc=xloc.bar_index, style=label.style_label_left, color=color.new(color.lime, 20), textcolor=color.black, size=size.tiny)
+            label.new(bar_index + extendTradeBars, activeSL, "SL " + str.tostring(activeSL, format.mintick), xloc=xloc.bar_index, style=label.style_label_left, color=slTagColor, textcolor=color.white, size=size.tiny)
+            label.new(bar_index + extendTradeBars, activeTP, "TP " + str.tostring(activeTP, format.mintick), xloc=xloc.bar_index, style=label.style_label_left, color=tpTagColor, textcolor=color.white, size=size.tiny)
+
+if shortSetup
+    riskPts = boxMid - close
+    if riskPts > 0
+        riskDollars = riskPts * dollarPerPoint * 1
+        
+        if riskDollars > maxRiskPerTrade
+            qty = math.max(1, math.floor(maxRiskPerTrade / (riskPts * dollarPerPoint)))
+        else
+            qty = 1
+        
+        if dailyPnL + (riskPts * dollarPerPoint * qty) > maxDailyLoss
+            qty = 0
+        
+        if qty > 0
+            inTrade        := true
+            activeSide     := "short"
+            activeEntry    := close
+            activeSL       := boxMid
+            activeTP       := close - riskPts * rrMultiple
+            entryBarIndex  := bar_index
+            activeQty      := qty
+            activeRisk     := riskPts * dollarPerPoint * qty
+            partialClosed  := false
+            tradeTakenToday := true
+            shortFire      := true
+            totalTrades    += 1
+
+            strategy.entry("Short", strategy.short, qty=qty)
+
+            line.new(bar_index, activeEntry, bar_index + extendTradeBars, activeEntry, color=color.new(color.red, 20), width=2, style=line.style_solid)
+            line.new(bar_index, activeSL, bar_index + extendTradeBars, activeSL, color=slLineColor, width=2, style=line.style_dotted)
+            line.new(bar_index, activeTP, bar_index + extendTradeBars, activeTP, color=tpLineColor, width=2, style=line.style_dotted)
+
+            label.new(bar_index + extendTradeBars, activeEntry, "E " + str.tostring(activeEntry, format.mintick), xloc=xloc.bar_index, style=label.style_label_left, color=color.new(color.red, 20), textcolor=color.white, size=size.tiny)
+            label.new(bar_index + extendTradeBars, activeSL, "SL " + str.tostring(activeSL, format.mintick), xloc=xloc.bar_index, style=label.style_label_left, color=slTagColor, textcolor=color.white, size=size.tiny)
+            label.new(bar_index + extendTradeBars, activeTP, "TP " + str.tostring(activeTP, format.mintick), xloc=xloc.bar_index, style=label.style_label_left, color=tpTagColor, textcolor=color.white, size=size.tiny)
+
+
+// ───────────────────────── MANAGE / EXIT TRADE ─────────────────────────
+if inTrade and activeSide == "long" and bar_index >= entryBarIndex + 1
+    strategy.exit("Long Exit", from_entry="Long", stop=activeSL, limit=activeTP)
+
+    if enablePartialExit and not partialClosed
+        partialTarget = activeEntry + (activeTP - activeEntry) * 0.5
+        if high >= partialTarget
+            partialQty = math.max(1, math.floor(activeQty * 0.5))
+            strategy.close("Long", qty=partialQty, comment="Partial 50%")
+            label.new(bar_index, partialTarget, "50%", style=label.style_label_down, color=color.new(color.teal, 10), textcolor=color.white, size=size.tiny)
+            partialClosed := true
+
+    hitSL = low <= activeSL
+    hitTP = high >= activeTP
+
+    if hitSL
+        label.new(bar_index, activeSL, "SL", style=label.style_label_down, color=slTagColor, textcolor=color.white, size=size.tiny)
+        slFire := true
+        pnl = (activeSL - activeEntry) * activeQty * dollarPerPoint
+        dailyPnL += pnl
+        totalPnL += pnl
+        lossTrades += 1
+        inTrade := false
+        activeSide := na
+
+    else if hitTP
+        label.new(bar_index, activeTP, "TP", style=label.style_label_down, color=tpTagColor, textcolor=color.white, size=size.tiny)
+        tpFire := true
+        pnl = (activeTP - activeEntry) * activeQty * dollarPerPoint
+        dailyPnL += pnl
+        totalPnL += pnl
+        winTrades += 1
+        inTrade := false
+        activeSide := na
+
+if inTrade and activeSide == "short" and bar_index >= entryBarIndex + 1
+    strategy.exit("Short Exit", from_entry="Short", stop=activeSL, limit=activeTP)
+
+    if enablePartialExit and not partialClosed
+        partialTarget = activeEntry - (activeEntry - activeTP) * 0.5
+        if low <= partialTarget
+            partialQty = math.max(1, math.floor(activeQty * 0.5))
+            strategy.close("Short", qty=partialQty, comment="Partial 50%")
+            label.new(bar_index, partialTarget, "50%", style=label.style_label_up, color=color.new(color.teal, 10), textcolor=color.white, size=size.tiny)
+            partialClosed := true
+
+    hitSL = high >= activeSL
+    hitTP = low <= activeTP
+
+    if hitSL
+        label.new(bar_index, activeSL, "SL", style=label.style_label_up, color=slTagColor, textcolor=color.white, size=size.tiny)
+        slFire := true
+        pnl = (activeEntry - activeSL) * activeQty * dollarPerPoint
+        dailyPnL += pnl
+        totalPnL += pnl
+        lossTrades += 1
+        inTrade := false
+        activeSide := na
+
+    else if hitTP
+        label.new(bar_index, activeTP, "TP", style=label.style_label_up, color=tpTagColor, textcolor=color.white, size=size.tiny)
+        tpFire := true
+        pnl = (activeEntry - activeTP) * activeQty * dollarPerPoint
+        dailyPnL += pnl
+        totalPnL += pnl
+        winTrades += 1
+        inTrade := false
+        activeSide := na
+
+
+// ───────────────────────── FTMO RULE: DAILY LOSS LIMIT ─────────────────────────
+if dailyPnL <= -maxDailyLoss and inTrade
+    strategy.close_all(comment="Daily Loss Limit Hit")
+    label.new(bar_index, high, "DAILY LOSS LIMIT", style=label.style_label_down, color=warningColor, textcolor=color.white, size=size.small)
+    flatFire := true
+    inTrade := false
+    activeSide := na
+
+
+// ───────────────────────── FTMO RULE: ACCOUNT DRAWDOWN LIMIT ─────────────────────────
+currentDD = peakAccountValue - strategy.equity
+if currentDD >= maxAccountDD and inTrade
+    strategy.close_all(comment="Drawdown Limit Hit")
+    label.new(bar_index, high, "DRAWDOWN LIMIT", style=label.style_label_down, color=warningColor, textcolor=color.white, size=size.small)
+    flatFire := true
+    inTrade := false
+    activeSide := na
+
+
+// ───────────────────────── MANDATORY: NO OVERNIGHT HOLD (FTMO RULE) ─────────────────────────
+isSessionEnd = inTradingWindow[1] and not inTradingWindow
+
+if isSessionEnd and inTrade
+    strategy.close_all(comment="Session Close - No Overnight Hold")
+    flatLabelY = (activeSide == "long" ? high : low)
+    flatLabelStyle = (activeSide == "long" ? label.style_label_down : label.style_label_up)
+    label.new(bar_index, flatLabelY, "SESSION CLOSE", style=flatLabelStyle, color=flatColor, textcolor=color.white, size=size.tiny)
+    flatFire := true
+    inTrade := false
+    activeSide := na
+
+
+// ───────────────────────── PLOTS ─────────────────────────
+plotshape(longFire,  title="Long Entry",      style=shape.triangleup,   location=location.belowbar, color=color.new(color.lime, 0),   size=size.small)
+plotshape(shortFire, title="Short Entry",     style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 0),    size=size.small)
+plotshape(slFire,    title="SL Exit",         style=shape.xcross,       location=location.abovebar, color=color.new(color.maroon, 0), size=size.small)
+plotshape(tpFire,    title="TP Exit",         style=shape.xcross,       location=location.belowbar, color=color.new(color.teal, 0),   size=size.small)
+plotshape(flatFire,  title="Session Flatten", style=shape.diamond,      location=location.abovebar, color=color.new(color.gray, 0),   size=size.small)
+
+alertcondition(longSetup,  title="Long Entry",  message="Box retest long entry triggered.")
+alertcondition(shortSetup, title="Short Entry", message="Box retest short entry triggered.")
+alertcondition(slFire,     title="SL Hit",      message="Stop loss triggered.")
+alertcondition(tpFire,     title="TP Hit",      message="Take profit triggered.")
+alertcondition(dailyPnL <= -maxDailyLoss, title="Daily Loss Limit", message="Daily loss limit reached - position flattened.")
+alertcondition(currentDD >= maxAccountDD,  title="Drawdown Limit", message="Drawdown limit reached - position flattened.")
+
+
+// ───────────────────────── FTMO STATS PANEL ─────────────────────────
+if enableTradeStats and barstate.islast
+    // Calculate stats
+    winRate = totalTrades > 0 ? (winTrades / totalTrades) * 100 : 0
+    currentDD = peakAccountValue - strategy.equity
+    accountPct = (totalPnL / 200000.0) * 100
+    dailyPct = (dailyPnL / 200000.0) * 100
+    
+    // Draw stats table
+    var table statsTable = na
+    if na(statsTable)
+        statsTable := table.new(position.top_right, 4, 6, bgcolor=color.new(color.black, 80), border_color=color.new(color.white, 50), border_width=1)
+        
+        // Headers
+        table.cell(statsTable, 0, 0, text="FTMO STATS", bgcolor=color.new(color.orange, 50), text_color=color.white, text_halign=text.align_center)
+        table.merge_cells(statsTable, 0, 0, 3, 0)
+        
+        // Labels
+        table.cell(statsTable, 0, 1, text="Win Rate", bgcolor=color.new(color.gray, 60), text_color=color.white, text_halign=text.align_left)
+        table.cell(statsTable, 0, 2, text="Total Trades", bgcolor=color.new(color.gray, 60), text_color=color.white, text_halign=text.align_left)
+        table.cell(statsTable, 0, 3, text="Today P&L", bgcolor=color.new(color.gray, 60), text_color=color.white, text_halign=text.align_left)
+        table.cell(statsTable, 0, 4, text="Total P&L", bgcolor=color.new(color.gray, 60), text_color=color.white, text_halign=text.align_left)
+        table.cell(statsTable, 0, 5, text="Drawdown", bgcolor=color.new(color.gray, 60), text_color=color.white, text_halign=text.align_left)
+    
+    // Values
+    table.cell(statsTable, 1, 1, text=str.tostring(winRate, "0.0%"), bgcolor=winRate >= 50 ? color.new(color.green, 70) : color.new(color.red, 70), text_color=color.white)
+    table.cell(statsTable, 1, 2, text=str.tostring(totalTrades), bgcolor=color.new(color.blue, 70), text_color=color.white)
+    table.cell(statsTable, 1, 3, text="$" + str.tostring(dailyPnL, "0.00"), bgcolor=dailyPnL >= 0 ? color.new(color.green, 70) : color.new(color.red, 70), text_color=color.white)
+    table.cell(statsTable, 1, 4, text="$" + str.tostring(totalPnL, "0.00"), bgcolor=totalPnL >= 0 ? color.new(color.green, 70) : color.new(color.red, 70), text_color=color.white)
+    table.cell(statsTable, 1, 5, text="$" + str.tostring(currentDD, "0.00") + " (" + str.tostring((currentDD/maxAccountDD)*100, "0.0%") + ")", bgcolor=currentDD >= maxAccountDD * 0.8 ? color.new(color.maroon, 70) : color.new(color.gray, 70), text_color=color.white)
